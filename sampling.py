@@ -8,6 +8,14 @@ from model import utils as mutils
 _PREDICTORS = {}
 
 
+def _choose_tokens(probs, sampling_mode):
+    if sampling_mode == "sample":
+        return sample_categorical(probs)
+    if sampling_mode == "argmax":
+        return probs.argmax(dim=-1)
+    raise ValueError(f"Unknown sampling_mode: {sampling_mode}")
+
+
 def register_predictor(cls=None, *, name=None):
     """A decorator for registering predictor classes."""
 
@@ -74,7 +82,7 @@ class NonePredictor(Predictor):
 
 @register_predictor(name="analytic")
 class AnalyticPredictor(Predictor):
-    def update_fn(self, score_fn, x, t, step_size):
+    def update_fn(self, score_fn, x, t, step_size, sampling_mode="sample"):
         curr_sigma = self.noise(t)[0]
         next_sigma = self.noise(t - step_size)[0]
         dsigma = curr_sigma - next_sigma
@@ -83,7 +91,7 @@ class AnalyticPredictor(Predictor):
 
         stag_score = self.graph.staggered_score(score, dsigma)
         probs = stag_score * self.graph.transp_transition(x, dsigma)
-        return sample_categorical(probs)
+        return _choose_tokens(probs, sampling_mode)
 
     
 class Denoiser:
@@ -91,7 +99,7 @@ class Denoiser:
         self.graph = graph
         self.noise = noise
 
-    def update_fn(self, score_fn, x, t):
+    def update_fn(self, score_fn, x, t, sampling_mode="sample"):
         sigma = self.noise(t)[0]
 
         score = score_fn(x, sigma)
@@ -101,8 +109,7 @@ class Denoiser:
         if self.graph.absorb:
             probs = probs[..., :-1]
         
-        #return probs.argmax(dim=-1)
-        return sample_categorical(probs)
+        return _choose_tokens(probs, sampling_mode)
                        
 
 def get_sampling_fn(config, graph, noise, batch_dims, eps, device):
@@ -119,7 +126,19 @@ def get_sampling_fn(config, graph, noise, batch_dims, eps, device):
     return sampling_fn
     
 
-def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
+def get_pc_sampler(
+    graph,
+    noise,
+    batch_dims,
+    predictor,
+    steps,
+    denoise=True,
+    eps=1e-5,
+    device=torch.device('cpu'),
+    proj_fun=lambda x: x,
+    init_x=None,
+    sampling_mode="sample",
+):
     predictor = get_predictor(predictor)(graph, noise)
     projector = proj_fun
     denoiser = Denoiser(graph, noise)
@@ -127,21 +146,30 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
     @torch.no_grad()
     def pc_sampler(model):
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
-        x = graph.sample_limit(*batch_dims).to(device)
+        if init_x is None:
+            x = graph.sample_limit(*batch_dims).to(device)
+        else:
+            x = init_x.to(device)
+        x = projector(x)
         timesteps = torch.linspace(1, eps, steps + 1, device=device)
         dt = (1 - eps) / steps
 
         for i in range(steps):
             t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
             x = projector(x)
-            x = predictor.update_fn(sampling_score_fn, x, t, dt)
+            if isinstance(predictor, AnalyticPredictor):
+                x = predictor.update_fn(sampling_score_fn, x, t, dt, sampling_mode)
+            else:
+                x = predictor.update_fn(sampling_score_fn, x, t, dt)
+            x = projector(x)
             
 
         if denoise:
             # denoising step
             x = projector(x)
             t = timesteps[-1] * torch.ones(x.shape[0], 1, device=device)
-            x = denoiser.update_fn(sampling_score_fn, x, t)
+            x = denoiser.update_fn(sampling_score_fn, x, t, sampling_mode)
+            x = projector(x)
             
         return x
     
@@ -150,41 +178,64 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
 
 
 
-def get_conditional_sampler(graph, noise, question_ids, steps=128, eps=1e-4, device="cuda"):
-    from catsample import sample_categorical
-
+def get_prompt_clamped_sampler(
+    graph,
+    noise,
+    prompt_ids,
+    max_answer_len=512,
+    max_length=1024,
+    steps=128,
+    predictor="analytic",
+    denoise=True,
+    eps=1e-4,
+    device="cuda",
+    sampling_mode="sample",
+):
     @torch.no_grad()
     def sampler(model):
-        score_fn = mutils.get_score_fn(model, train=False, sampling=True)
-        B, q_len = question_ids.shape
-        ans_len = 1024 - q_len
+        prompt = prompt_ids.to(device)
+        B, prompt_len = prompt.shape
+        answer_len = min(max_answer_len, max_length - prompt_len)
+        if answer_len <= 0:
+            raise ValueError("prompt is too long for the requested max_length")
 
-        x_ans = graph.sample_limit(B, ans_len).to(device)
-        x = torch.cat([question_ids.to(device), x_ans], dim=1)
+        x_answer = graph.sample_limit(B, answer_len).to(device)
+        x = torch.cat([prompt, x_answer], dim=1)
 
-        timesteps = torch.linspace(1, eps, steps + 1, device=device)
-        dt = (1 - eps) / steps
+        def clamp_prompt(y):
+            y = y.clone()
+            y[:, :prompt_len] = prompt
+            return y
 
-        for i in range(steps):
-            t = timesteps[i] * torch.ones(B, 1, device=device)
-            sigma, dsigma = noise(t)
-            score = score_fn(x, sigma.squeeze(-1))
+        sampling_fn = get_pc_sampler(
+            graph=graph,
+            noise=noise,
+            batch_dims=(B, prompt_len + answer_len),
+            predictor=predictor,
+            steps=steps,
+            denoise=denoise,
+            eps=eps,
+            device=device,
+            proj_fun=clamp_prompt,
+            init_x=x,
+            sampling_mode=sampling_mode,
+        )
+        return sampling_fn(model)
 
-            stag_score = graph.staggered_score(score, dsigma.squeeze(-1) * dt)
-            probs = stag_score * graph.transp_transition(x, dsigma.squeeze(-1) * dt)
+    return sampler
 
-            x_new = sample_categorical(probs)
-            x = torch.cat([question_ids.to(device), x_new[:, q_len:]], dim=1)
 
-        t = timesteps[-1] * torch.ones(B, 1, device=device)
-        sigma = noise(t)[0]
-        score = score_fn(x, sigma.squeeze(-1))
-        stag_score = graph.staggered_score(score, sigma.squeeze(-1))
-        probs = stag_score * graph.transp_transition(x, sigma.squeeze(-1))
-        if graph.absorb:
-            probs = probs[..., :-1]
-        x_ans_final = sample_categorical(probs)[:, q_len:]
-        x = torch.cat([question_ids.to(device), x_ans_final], dim=1)
-        return x
-
+def get_conditional_sampler(graph, noise, question_ids, steps=128, eps=1e-4, device="cuda"):
+    sampler = get_prompt_clamped_sampler(
+        graph=graph,
+        noise=noise,
+        prompt_ids=question_ids,
+        max_answer_len=1024 - question_ids.shape[1],
+        max_length=1024,
+        steps=steps,
+        predictor="analytic",
+        denoise=True,
+        eps=eps,
+        device=device,
+    )
     return sampler

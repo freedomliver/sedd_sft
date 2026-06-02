@@ -1,169 +1,329 @@
-"""
-评估脚本：在 s1K_train_599.json 样本上做条件采样推理，
-提取模型输出 \boxed{} 与数据集 \boxed{} 对比准确度。
-"""
-
-import json
 import argparse
-import torch
-import re
+import json
 import os
-import time
+from pathlib import Path
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
+import torch
 from transformers import GPT2TokenizerFast
-from omegaconf import OmegaConf
-from safetensors.torch import load_file
-from model import SEDD
+
+from data_sft import (
+    DEFAULT_DATASET,
+    S1KResponseDataset,
+    SFTFormatConfig,
+    build_prompt,
+    collate_sft,
+    get_answer_text,
+    load_s1k_records,
+    split_records,
+)
 import graph_lib
+import losses
 import noise_lib
-from sampling import get_conditional_sampler
+from sampling import get_prompt_clamped_sampler
+from sft_utils import (
+    decode_until_eos,
+    extract_boxed,
+    load_sedd_for_inference,
+    normalize_answer,
+    resolve_dtype,
+)
 
 
-def make_condition_ids(tokenizer, question, max_question_tokens=200):
-    # Training uses question + eos + answer, so inference must condition on the same separator.
-    ids = tokenizer.encode(question)[:max_question_tokens]
-    ids.append(tokenizer.eos_token_id)
-    return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+def get_gold_answer(record: dict, answer_field: str = "solution") -> str | None:
+    answer = get_answer_text(record, answer_field)
+    boxed = extract_boxed(answer)
+    if boxed:
+        return boxed
+    return answer.strip() if answer and len(answer.strip()) < 100 else None
 
 
-def extract_boxed(text):
-    results = []
-    pos = 0
-    text = text or ""
-    while pos < len(text):
-        idx = text.find(r"\boxed{", pos)
-        if idx == -1:
+def make_prompt_ids(
+    tokenizer,
+    question: str,
+    answer_prefix: str = "Answer:",
+    answer_leading_newline: bool = False,
+    boxed_prompt: bool = False,
+    max_length: int = 1024,
+    min_answer_len: int = 32,
+):
+    if boxed_prompt:
+        prompt = build_prompt(question, answer_prefix, trailing_newline=True) + r"\boxed{"
+    else:
+        prompt = build_prompt(
+            question,
+            answer_prefix,
+            trailing_newline=not answer_leading_newline,
+        )
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    original_len = len(ids)
+    max_prompt_len = max(1, max_length - min_answer_len)
+    truncated = original_len > max_prompt_len
+    if truncated:
+        ids = ids[:max_prompt_len]
+    return torch.tensor(ids, dtype=torch.long).unsqueeze(0), truncated, original_len
+
+
+@torch.no_grad()
+def evaluate_response_loss(model, cfg, graph, noise, tokenizer, records, args, device):
+    format_cfg = SFTFormatConfig(
+        max_length=args.max_length,
+        max_answer_len=args.max_answer_len,
+        min_answer_len=args.min_answer_len,
+        answer_field=args.answer_field,
+        answer_truncate=args.answer_truncate,
+        answer_prefix=args.answer_prefix,
+        answer_leading_newline=args.answer_leading_newline,
+        boxed_prompt=args.boxed_prompt,
+        supervise_answer_window_eos=args.supervise_answer_window_eos,
+    )
+    dataset = S1KResponseDataset(records, tokenizer, format_cfg)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.loss_batch_size,
+        shuffle=False,
+        collate_fn=collate_sft,
+    )
+    loss_fn = losses.get_response_only_sft_loss_fn(noise, graph)
+    model.eval()
+    vals = []
+    dtype = resolve_dtype(args.dtype)
+    autocast_enabled = device.type == "cuda" and dtype != torch.float32
+    for idx, batch in enumerate(loader):
+        if args.loss_batches > 0 and idx >= args.loss_batches:
             break
-        start = idx + 7
-        depth = 1
-        i = start
-        while i < len(text) and depth > 0:
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-            i += 1
-        if depth == 0:
-            results.append(text[start : i - 1].strip())
-        pos = i
-    return results[-1] if results else None
-
-
-def get_gold_answer(sample):
-    sol = sample.get("solution", "").strip()
-    sol_boxed = extract_boxed(sol)
-    if sol_boxed:
-        return sol_boxed
-    ds_boxed = extract_boxed(sample.get("deepseek_attempt", ""))
-    if ds_boxed:
-        return ds_boxed
-    if sol and len(sol) < 100:
-        return sol
-    return None
-
-
-def normalize(s):
-    if s is None:
+        input_ids = batch["input_ids"].to(device)
+        answer_mask = batch["answer_mask"].to(device)
+        pad_mask = batch["pad_mask"].to(device)
+        prompt_len = batch["prompt_len"].to(device)
+        with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+            vals.append(
+                loss_fn(
+                    model,
+                    input_ids,
+                    answer_mask,
+                    pad_mask,
+                    prompt_len=prompt_len,
+                    answer_window_len=args.max_answer_len,
+                )
+                .mean()
+                .detach()
+            )
+    if not vals:
         return None
-    s = s.strip().replace(" ", "").replace(",", "")
-    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
-    s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
-    s = s.replace("\\", "").replace(" ", "").lower()
-    try:
-        f = float(s)
-        return str(int(f)) if f == int(f) else str(f)
-    except Exception:
-        return s
+    return torch.stack(vals).mean().item()
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="SEDD SFT math generation evaluation")
+    parser.add_argument("--pretrained", default="louaaron/sedd-medium")
+    parser.add_argument("--lora_ckpt", default=None)
+    parser.add_argument("--data_json", default=None)
+    parser.add_argument("--dataset_name", default=DEFAULT_DATASET)
+    parser.add_argument("--hf_split", default="train")
+    parser.add_argument("--cache_dir", default=None)
+    parser.add_argument("--split", choices=("train", "valid", "validation", "test", "all"), default="test")
+    parser.add_argument("--train_size", type=int, default=800)
+    parser.add_argument("--valid_size", type=int, default=100)
+    parser.add_argument("--test_size", type=int, default=100)
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=128)
+    parser.add_argument("--predictor", choices=("analytic", "euler", "none"), default="analytic")
+    parser.add_argument("--sampling_mode", choices=("sample", "argmax"), default="sample")
+    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--max_answer_len", type=int, default=32)
+    parser.add_argument("--min_answer_len", type=int, default=32)
+    parser.add_argument("--answer_field", default="final_boxed")
+    parser.add_argument("--answer_truncate", choices=("head", "tail"), default="head")
+    parser.add_argument("--answer_prefix", default="Answer:")
+    parser.add_argument("--answer_leading_newline", action="store_true")
+    parser.add_argument("--boxed_prompt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--supervise_answer_window_eos", action="store_true")
+    parser.add_argument("--direct_answer_match", action="store_true")
+    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
+    parser.add_argument("--out_jsonl", default="outputs/eval_sft.jsonl")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--eval_loss", action="store_true")
+    parser.add_argument("--loss_batch_size", type=int, default=4)
+    parser.add_argument("--loss_batches", type=int, default=10)
+    parser.add_argument("--offline", action="store_true")
+    return parser
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--steps", type=int, default=128)
-    parser.add_argument("--out_jsonl", default="logs/eval_v9_generations.jsonl")
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
+    if args.offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
-    device = torch.device("cuda")
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = resolve_dtype(args.dtype)
+    autocast_enabled = device.type == "cuda" and dtype != torch.float32
+    print("Loading tokenizer: gpt2", flush=True)
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2", local_files_only=args.offline)
 
-    pretrained_path = "pretrained/sedd-small"
-    ckpt_path = "/root/autodl-tmp/sedd_checkpoints/sedd_sft_v9_final.pt"
-
-    print(f"Loading model from {pretrained_path} + {ckpt_path} ...")
-    t0 = time.time()
-    with open(os.path.join(pretrained_path, "config.json")) as f:
-        cfg = OmegaConf.create(json.load(f))
-    model = SEDD(cfg)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt)
-    model = model.to(device).eval()
-    print(f"Model loaded in {time.time() - t0:.1f}s", flush=True)
-
+    print(f"Loading base model: {args.pretrained}", flush=True)
+    model, cfg, lora_info = load_sedd_for_inference(args.pretrained, args.lora_ckpt, device, dtype)
+    if lora_info:
+        print(f"Loaded LoRA checkpoint: {args.lora_ckpt}", flush=True)
     graph = graph_lib.get_graph(cfg, device)
     noise = noise_lib.get_noise(cfg).to(device)
 
-    with open("data/s1K_train_599.json") as f:
-        correct_data = json.load(f)
+    rows = load_s1k_records(args.data_json, args.dataset_name, args.hf_split, args.cache_dir)
+    records = split_records(
+        rows,
+        args.split,
+        train_size=args.train_size,
+        valid_size=args.valid_size,
+        test_size=args.test_size,
+        seed=args.seed,
+    )
+    records = [row for row in records if get_gold_answer(row, args.answer_field) is not None]
+    records = records[args.start_idx : args.start_idx + args.limit]
+    print(f"Evaluating {len(records)} samples from split={args.split}", flush=True)
 
-    eval_samples = [r for r in correct_data if get_gold_answer(r) is not None]
-    print(f"Samples with gold answer: {len(eval_samples)} / {len(correct_data)}")
+    if args.eval_loss:
+        val_loss = evaluate_response_loss(model, cfg, graph, noise, tokenizer, records, args, device)
+        if val_loss is None:
+            print("response_only_dwdse=nan (no loss batches)", flush=True)
+        else:
+            print(f"response_only_dwdse={val_loss:.4f}", flush=True)
 
-    total = min(args.limit, len(eval_samples))
-    correct = 0
-    no_boxed_pred = 0
+    out_path = Path(args.out_jsonl)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pass1_correct = 0
+    passk_correct = 0
+    no_boxed = 0
+    empty = 0
+    no_eos = 0
+    exact_correct = 0
+    prompt_truncated = 0
+    total_len = 0
+    total_generations = 0
 
-    print(f"\nEvaluating {total} samples ...\n")
-    os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
-    with open(args.out_jsonl, "w", encoding="utf-8") as out:
-        for i in range(total):
-            sample = eval_samples[i]
-            gold = get_gold_answer(sample)
+    with out_path.open("w", encoding="utf-8") as out:
+        for local_idx, record in enumerate(records):
+            idx = args.start_idx + local_idx
+            gold = get_gold_answer(record, args.answer_field)
+            target_answer = get_answer_text(record, args.answer_field)
+            prompt_ids, was_truncated, prompt_original_len = make_prompt_ids(
+                tokenizer,
+                record["question"],
+                args.answer_prefix,
+                args.answer_leading_newline,
+                args.boxed_prompt,
+                args.max_length,
+                args.min_answer_len,
+            )
+            prompt_truncated += int(was_truncated)
+            sampler = get_prompt_clamped_sampler(
+                graph=graph,
+                noise=noise,
+                prompt_ids=prompt_ids,
+                max_answer_len=args.max_answer_len,
+                max_length=args.max_length,
+                steps=args.steps,
+                predictor=args.predictor,
+                denoise=True,
+                device=device,
+                sampling_mode=args.sampling_mode,
+            )
 
-            q_ids = make_condition_ids(tokenizer, sample["question"])
+            generations = []
+            for sample_idx in range(args.num_samples):
+                with torch.no_grad(), torch.amp.autocast(
+                    device_type=device.type,
+                    dtype=dtype,
+                    enabled=autocast_enabled,
+                ):
+                    generated = sampler(model)
 
-            sampler = get_conditional_sampler(graph, noise, q_ids, steps=args.steps, device=device)
-            with torch.no_grad():
-                gen = sampler(model)
+                answer_ids = generated[0, prompt_ids.shape[1] :]
+                eos_present = tokenizer.eos_token_id in answer_ids.detach().cpu().tolist()
+                answer_suffix = decode_until_eos(tokenizer, answer_ids)
+                direct_answer_match = args.direct_answer_match or (
+                    not args.boxed_prompt and args.answer_field == "solution"
+                )
+                if args.boxed_prompt:
+                    pred_boxed = answer_suffix.strip()
+                    answer_text = f"\\boxed{{{pred_boxed}}}"
+                elif direct_answer_match:
+                    answer_text = answer_suffix
+                    pred_boxed = answer_suffix.strip()
+                else:
+                    answer_text = answer_suffix
+                    pred_boxed = extract_boxed(answer_text)
+                match = normalize_answer(pred_boxed) == normalize_answer(gold)
+                exact = answer_text.strip() == target_answer.strip()
 
-            gen_text = tokenizer.decode(gen[0, q_ids.shape[1]:])
-            pred_boxed = extract_boxed(gen_text)
+                no_boxed += int(pred_boxed is None)
+                empty += int(not answer_text.strip())
+                no_eos += int(not eos_present)
+                total_len += len(tokenizer.encode(answer_text, add_special_tokens=False))
+                total_generations += 1
+                generations.append(
+                    {
+                        "sample_idx": sample_idx,
+                        "generated": answer_text,
+                        "generated_suffix": answer_suffix,
+                        "pred_boxed": pred_boxed,
+                        "match": match,
+                        "exact": exact,
+                        "eos_present": eos_present,
+                    }
+                )
 
-            if pred_boxed is None:
-                no_boxed_pred += 1
-
-            match = normalize(pred_boxed) == normalize(gold)
-            if match:
-                correct += 1
+            first = generations[0]
+            pass1_correct += int(first["match"])
+            exact_correct += int(first["exact"])
+            any_match = any(item["match"] for item in generations)
+            passk_correct += int(any_match)
 
             row = {
-                "idx": i,
-                "question": sample["question"],
+                "idx": idx,
+                "question": record["question"],
                 "gold": gold,
-                "generated": gen_text,
-                "pred_boxed": pred_boxed,
-                "match": match,
+                "target_answer": target_answer,
+                "generated": first["generated"],
+                "pred_boxed": first["pred_boxed"],
+                "match": first["match"],
+                "exact": first["exact"],
+                "eos_present": first["eos_present"],
+                "prompt_len": int(prompt_ids.shape[1]),
+                "prompt_original_len": prompt_original_len,
+                "prompt_truncated": was_truncated,
+                "pass_at_k": any_match,
+                "num_samples": args.num_samples,
+                "generations": generations,
             }
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
 
-            status = "OK" if match else "FAIL"
-            print(f"[{i:3d}] {status} | gold={gold[:50] if gold else None} | pred={pred_boxed}")
-            if i < 5:
-                print(f"      gen[:500]={gen_text[:500]}")
+            print(
+                f"[{idx:3d}] {'OK' if any_match else 'FAIL'} "
+                f"gold={gold} pred@1={first['pred_boxed']}",
+                flush=True,
+            )
+            if idx < 5:
+                print(f"      gen[:500]={first['generated'][:500]}", flush=True)
 
-            if (i + 1) % 50 == 0:
-                print(f"--- Progress: {correct}/{i+1} = {correct/(i+1):.1%} | no_boxed_pred={no_boxed_pred} ---\n")
-
-    print("\n" + "=" * 60)
-    print(f"Answer Accuracy (boxed match): {correct}/{total} = {correct/total:.1%}")
-    print(f"Predictions without boxed: {no_boxed_pred}/{total} = {no_boxed_pred/total:.1%}")
-    print(f"Raw generations: {args.out_jsonl}")
+    total = max(len(records), 1)
+    gen_total = max(total_generations, 1)
+    print("=" * 60)
+    print(f"pass@1_boxed_match: {pass1_correct}/{len(records)} = {pass1_correct / total:.1%}")
+    print(f"exact_target_match: {exact_correct}/{len(records)} = {exact_correct / total:.1%}")
+    print(f"pass@{args.num_samples}_boxed_match: {passk_correct}/{len(records)} = {passk_correct / total:.1%}")
+    print(f"no_boxed_generations: {no_boxed}/{total_generations} = {no_boxed / gen_total:.1%}")
+    print(f"empty_generations: {empty}/{total_generations} = {empty / gen_total:.1%}")
+    print(f"no_eos_generations: {no_eos}/{total_generations} = {no_eos / gen_total:.1%}")
+    print(f"prompt_truncated: {prompt_truncated}/{len(records)} = {prompt_truncated / total:.1%}")
+    print(f"avg_gen_tokens: {total_len / gen_total:.1f}")
+    print(f"raw_generations: {out_path}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    os.chdir("/root/sedd")
     main()

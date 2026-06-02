@@ -41,6 +41,44 @@ local_model, graph, noise = load_model("exp_local/experiment)
 
 This loading gives the model, as well as the graph and noise (which are used for the loss/sampling setup).
 
+## Supervised Fine-Tuning
+
+This fork adds a response-only supervised fine-tuning path for math problems:
+
+1. `data_sft.py` formats `Question:\n...\n\nAnswer:\n...` examples and builds prompt/answer/pad masks.
+2. `losses.py` implements response-only DWDSE so prompt and padding stay clean while only answer tokens are noised and trained.
+3. `lora.py` injects LoRA adapters into attention and MLP linear layers while freezing the base model.
+4. `train_sft.py` trains LoRA adapters and saves LoRA-only checkpoints.
+5. `infer_sft.py` and `eval_correct.py` run prompt-clamped generation and boxed-answer evaluation.
+
+Example LoRA-SFT run:
+
+```bash
+python train_sft.py \
+  --pretrained pretrained/sedd-medium \
+  --data_json data/s1K_train_599.json \
+  --out_dir outputs/lora_sft \
+  --max_steps 1000 \
+  --batch_size 4 \
+  --grad_accum 4 \
+  --lr 5e-5 \
+  --offline
+```
+
+Continue a LoRA run:
+
+```bash
+python train_sft.py \
+  --pretrained pretrained/sedd-medium \
+  --data_json data/s1K_train_599.json \
+  --out_dir outputs/lora_sft \
+  --resume_lora_ckpt outputs/lora_sft/checkpoint_last.pt \
+  --max_steps 1000 \
+  --offline
+```
+
+See `INTERVIEW_PROGRESS.md` for the experiment plan, RL exploration notes, demo commands, and failure analysis.
+
 ### Run Sampling
 
 We can run sampling using a command 
