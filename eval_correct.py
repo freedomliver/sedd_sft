@@ -244,13 +244,10 @@ def main():
                 answer_ids = generated[0, prompt_ids.shape[1] :]
                 eos_present = tokenizer.eos_token_id in answer_ids.detach().cpu().tolist()
                 answer_suffix = decode_until_eos(tokenizer, answer_ids)
-                direct_answer_match = args.direct_answer_match or (
-                    not args.boxed_prompt and args.answer_field == "solution"
-                )
                 if args.boxed_prompt:
                     pred_boxed = answer_suffix.strip()
                     answer_text = f"\\boxed{{{pred_boxed}}}"
-                elif direct_answer_match:
+                elif args.direct_answer_match:
                     answer_text = answer_suffix
                     pred_boxed = answer_suffix.strip()
                 else:

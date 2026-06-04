@@ -137,6 +137,8 @@ def get_response_only_sft_loss_fn(
     high_t_frac=0.0,
     high_t_min=0.75,
     high_t_max=None,
+    final_answer_weight=1.0,
+    final_answer_pad_weight=1.0,
 ):
     """Response-only DWDSE loss for conditional SEDD SFT.
 
@@ -152,6 +154,10 @@ def get_response_only_sft_loss_fn(
         sigma_max=None,
         prompt_len=None,
         answer_window_len=None,
+        final_answer_start=None,
+        final_answer_len=None,
+        t=None,
+        perturbed_batch=None,
     ):
         batch = batch.long()
         B = batch.shape[0]
@@ -162,21 +168,31 @@ def get_response_only_sft_loss_fn(
         if not torch.any(loss_mask):
             raise ValueError("response-only SFT batch has no answer tokens")
 
-        t = _sample_t(B, batch.device, sampling_eps, sigma_max, t_min=t_min, t_max=t_max)
-        if high_t_frac > 0:
-            high_t = _sample_t(
-                B,
-                batch.device,
-                sampling_eps,
-                sigma_max,
-                t_min=high_t_min,
-                t_max=high_t_max if high_t_max is not None else t_max,
-            )
-            choose_high = torch.rand(B, device=batch.device) < high_t_frac
-            t = torch.where(choose_high, high_t, t)
+        if t is None:
+            t = _sample_t(B, batch.device, sampling_eps, sigma_max, t_min=t_min, t_max=t_max)
+            if high_t_frac > 0:
+                high_t = _sample_t(
+                    B,
+                    batch.device,
+                    sampling_eps,
+                    sigma_max,
+                    t_min=high_t_min,
+                    t_max=high_t_max if high_t_max is not None else t_max,
+                )
+                choose_high = torch.rand(B, device=batch.device) < high_t_frac
+                t = torch.where(choose_high, high_t, t)
+        elif not torch.is_tensor(t):
+            t = torch.full((B,), float(t), device=batch.device)
+        else:
+            t = t.to(batch.device)
+            if t.ndim == 0:
+                t = t.expand(B)
         sigma, dsigma = noise(t)
 
-        noisy_batch = graph.sample_transition(batch, sigma[:, None])
+        if perturbed_batch is None:
+            noisy_batch = graph.sample_transition(batch, sigma[:, None])
+        else:
+            noisy_batch = perturbed_batch.long().to(batch.device)
         perturb_mask = loss_mask
         if prompt_len is not None:
             positions = torch.arange(batch.shape[1], device=batch.device).unsqueeze(0)
@@ -190,8 +206,46 @@ def get_response_only_sft_loss_fn(
         log_score = log_score_fn(perturbed, sigma)
         token_loss = graph.score_entropy(log_score, sigma[:, None], perturbed, batch)
 
-        weighted = dsigma[:, None] * token_loss * loss_mask.to(token_loss.dtype)
-        denom = loss_mask.sum(dim=-1).clamp_min(1).to(token_loss.dtype)
+        token_weight = loss_mask.to(token_loss.dtype)
+        if final_answer_weight != 1.0 or final_answer_pad_weight != 1.0:
+            weighted_final_answer_start = final_answer_start
+            if weighted_final_answer_start is None:
+                if prompt_len is None:
+                    raise ValueError(
+                        "final_answer weights require final_answer_start or prompt_len"
+                    )
+                weighted_final_answer_start = prompt_len
+            positions = torch.arange(batch.shape[1], device=batch.device).unsqueeze(0)
+            final_start = weighted_final_answer_start.to(batch.device).long().unsqueeze(1)
+            answer_end = None
+            if final_answer_len is not None:
+                answer_end = final_start + final_answer_len.to(batch.device).long().unsqueeze(1)
+
+            final_answer_mask = loss_mask & (positions >= final_start)
+            if answer_end is not None:
+                final_answer_mask = final_answer_mask & (positions < answer_end)
+            elif answer_window_len is not None:
+                final_answer_mask = final_answer_mask & (
+                    positions < final_start + int(answer_window_len)
+                )
+
+            final_answer_pad_mask = loss_mask & (positions >= final_start)
+            if answer_end is not None:
+                final_answer_pad_mask = final_answer_pad_mask & (positions >= answer_end)
+            if answer_window_len is not None:
+                final_answer_pad_mask = final_answer_pad_mask & (
+                    positions < final_start + int(answer_window_len)
+                )
+
+            token_weight = token_weight + (final_answer_weight - 1.0) * final_answer_mask.to(
+                token_loss.dtype
+            )
+            token_weight = token_weight + (
+                final_answer_pad_weight - 1.0
+            ) * final_answer_pad_mask.to(token_loss.dtype)
+
+        weighted = dsigma[:, None] * token_loss * token_weight
+        denom = token_weight.sum(dim=-1).clamp_min(1).to(token_loss.dtype)
         return weighted.sum(dim=-1) / denom
 
     return loss_fn
@@ -214,7 +268,16 @@ def get_answer_all_mask_ce_loss_fn(
 
     t_values = tuple(float(t) for t in t_values)
 
-    def loss_fn(model, batch, answer_mask, pad_mask=None, prompt_len=None, answer_window_len=None):
+    def loss_fn(
+        model,
+        batch,
+        answer_mask,
+        pad_mask=None,
+        prompt_len=None,
+        answer_window_len=None,
+        final_answer_start=None,
+        final_answer_len=None,
+    ):
         batch = batch.long()
         if pad_mask is None:
             pad_mask = torch.ones_like(answer_mask, dtype=torch.bool)

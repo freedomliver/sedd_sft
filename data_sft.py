@@ -1,11 +1,25 @@
+from __future__ import annotations
+
+import ast
 import json
 import random
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-from transformers import GPT2TokenizerFast
+try:
+    import torch
+    from torch.utils.data import DataLoader, Dataset
+except ModuleNotFoundError:
+    torch = None
+    DataLoader = None
+
+    class Dataset:
+        pass
+try:
+    from transformers import GPT2TokenizerFast
+except ModuleNotFoundError:
+    GPT2TokenizerFast = None
 
 
 DEFAULT_DATASET = "simplescaling/s1K-1.1"
@@ -22,13 +36,30 @@ def build_prompt(
     return f"{prompt}\n" if trailing_newline else prompt
 
 
+def _lookup_text(source: dict | None, key: str) -> str | None:
+    if not isinstance(source, dict):
+        return None
+    value = source.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
 def get_answer_text(record: dict, answer_field: str = "solution") -> str:
+    metadata = record.get("metadata") if isinstance(record, dict) else None
+
     if answer_field in {"boxed_inner", "final_boxed_inner", "boxed_answer_inner"}:
         boxed = extract_boxed(record.get("deepseek_attempt", "")) or extract_boxed(
             record.get("solution", "")
         )
         if boxed:
             return boxed
+        for key in ("boxed_inner", "final_answer", "answer", "Correct Answer", "Pre-Revision Correct Answer"):
+            answer = _lookup_text(record, key) or _lookup_text(metadata, key)
+            if answer:
+                boxed = extract_boxed(answer)
+                return boxed if boxed is not None else answer
 
     if answer_field in {"boxed", "final_boxed", "boxed_answer"}:
         boxed = extract_boxed(record.get("deepseek_attempt", "")) or extract_boxed(
@@ -36,18 +67,172 @@ def get_answer_text(record: dict, answer_field: str = "solution") -> str:
         )
         if boxed:
             return f"\\boxed{{{boxed}}}"
+        for key in ("boxed", "final_boxed", "boxed_answer", "final_answer", "answer", "Correct Answer", "Pre-Revision Correct Answer"):
+            answer = _lookup_text(record, key) or _lookup_text(metadata, key)
+            if answer:
+                boxed = extract_boxed(answer)
+                if boxed is not None:
+                    return f"\\boxed{{{boxed}}}"
+                return f"\\boxed{{{answer}}}"
 
-    answer = record.get(answer_field)
+    answer = _lookup_text(record, answer_field) or _lookup_text(metadata, answer_field)
     if answer:
-        return str(answer).strip()
-    for fallback in ("solution", "deepseek_attempt", "answer"):
-        answer = record.get(fallback)
+        return answer
+    for fallback in ("solution", "deepseek_attempt", "answer", "final_answer", "Correct Answer", "Pre-Revision Correct Answer"):
+        answer = _lookup_text(record, fallback) or _lookup_text(metadata, fallback)
         if answer:
-            return str(answer).strip()
+            return answer
     return ""
 
 
+def _unwrap_singleton_sequence_text(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if text[0] not in "[(":
+        return text
+    try:
+        value = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return text
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return str(value[0]).strip()
+    return text
+
+
+def _extract_answer_after_label(text: str) -> str | None:
+    matches = list(
+        re.finditer(
+            r"(?im)(?:^|\n)\s*(?:final\s+)?answer\s*(?:is|=|:)?\s*",
+            str(text or ""),
+        )
+    )
+    if not matches:
+        return None
+    tail = text[matches[-1].end() :].strip()
+    if not tail:
+        return None
+    boxed = extract_boxed(tail)
+    if boxed is not None:
+        return boxed
+    return tail.splitlines()[0].strip()
+
+
+def _looks_like_reasoning_text(text: str) -> bool:
+    text = str(text or "").strip()
+    if len(text) > 300:
+        return True
+    return bool(re.search(r"(?im)(^|\n)\s*(method|steps?)\s*:", text))
+
+
+def _clean_scalar_answer(text: str) -> str:
+    text = _unwrap_singleton_sequence_text(str(text or "").strip())
+    text = text.replace(r"\$", "$").strip()
+    boxed = extract_boxed(text)
+    if boxed is not None:
+        return _clean_scalar_answer(boxed)
+    labeled = _extract_answer_after_label(text)
+    if labeled is not None and labeled != text:
+        return _clean_scalar_answer(labeled)
+    text = re.sub(
+        r"(?is)^\s*(?:final\s+)?answer\s*(?:is|=|:)?\s*",
+        "",
+        text,
+    ).strip()
+    for left, right in (("\\(", "\\)"), ("\\[", "\\]"), ("$", "$")):
+        if text.startswith(left) and text.endswith(right):
+            text = text[len(left) : len(text) - len(right)].strip()
+    text = text.strip("'\" ")
+    if text.endswith(".") and not re.search(r"\d\.\d\.$", text):
+        text = text[:-1].strip()
+    return text.strip()
+
+
+def _clean_final_answer_candidate(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = _unwrap_singleton_sequence_text(str(text).strip())
+    if not text:
+        return None
+    boxed = extract_boxed(text)
+    if boxed is not None:
+        return _clean_scalar_answer(boxed)
+    labeled = _extract_answer_after_label(text)
+    if labeled:
+        return _clean_scalar_answer(labeled)
+    if _looks_like_reasoning_text(text):
+        return None
+    answer = _clean_scalar_answer(text)
+    return answer if answer else None
+
+
+def iter_final_answer_candidates(
+    record: dict,
+    answer_field: str = "answer",
+    source_answer: str | None = None,
+) -> Iterable[tuple[str, str]]:
+    metadata = record.get("metadata") if isinstance(record, dict) else None
+    seen: set[tuple[str, str]] = set()
+
+    def add(source: str, value: str | None):
+        if not value:
+            return
+        key = (source, value)
+        if key in seen:
+            return
+        seen.add(key)
+        yield source, value
+
+    requested_sources = [
+        (answer_field, _lookup_text(record, answer_field)),
+        (f"metadata.{answer_field}", _lookup_text(metadata, answer_field)),
+    ]
+    fallback_sources = [
+        ("boxed_inner", _lookup_text(record, "boxed_inner")),
+        ("metadata.boxed_inner", _lookup_text(metadata, "boxed_inner")),
+        ("final_answer", _lookup_text(record, "final_answer")),
+        ("metadata.final_answer", _lookup_text(metadata, "final_answer")),
+        ("answer", _lookup_text(record, "answer")),
+        ("metadata.answer", _lookup_text(metadata, "answer")),
+        ("Correct Answer", _lookup_text(record, "Correct Answer")),
+        ("metadata.Correct Answer", _lookup_text(metadata, "Correct Answer")),
+        (
+            "Pre-Revision Correct Answer",
+            _lookup_text(record, "Pre-Revision Correct Answer"),
+        ),
+        (
+            "metadata.Pre-Revision Correct Answer",
+            _lookup_text(metadata, "Pre-Revision Correct Answer"),
+        ),
+        ("deepseek_attempt", _lookup_text(record, "deepseek_attempt")),
+        ("solution", _lookup_text(record, "solution")),
+    ]
+    if source_answer:
+        fallback_sources.append(("source_answer", source_answer))
+
+    for source, value in requested_sources + fallback_sources:
+        yield from add(source, value)
+
+
+def get_final_answer_text(
+    record: dict,
+    answer_field: str = "answer",
+    source_answer: str | None = None,
+    return_source: bool = False,
+):
+    for source, value in iter_final_answer_candidates(record, answer_field, source_answer):
+        answer = _clean_final_answer_candidate(value)
+        if answer:
+            return (answer, source) if return_source else answer
+    return ("", "missing") if return_source else ""
+
+
 def extract_boxed(text) -> str | None:
+    spans = extract_boxed_spans(text)
+    return spans[-1][0] if spans else None
+
+
+def extract_boxed_spans(text) -> list[tuple[str, int, int]]:
     results = []
     pos = 0
     text = str(text or "")
@@ -65,9 +250,30 @@ def extract_boxed(text) -> str | None:
                 depth -= 1
             i += 1
         if depth == 0:
-            results.append(text[start : i - 1].strip())
+            results.append((text[start : i - 1].strip(), idx, i))
         pos = i
-    return results[-1] if results else None
+    return results
+
+
+def strip_last_boxed(text) -> str:
+    text = str(text or "")
+    spans = extract_boxed_spans(text)
+    if not spans:
+        return text.strip()
+
+    _, start, end = spans[-1]
+    before = text[:start].rstrip()
+    after = text[end:].strip()
+    if after and not all(ch in ".。,，;；:：!?！？ \n\t" for ch in after):
+        cleaned = f"{before} {after}".strip()
+    else:
+        cleaned = before
+    cleaned = re.sub(
+        r"(?i)(?:so|therefore|hence)?\s*(?:the\s+)?(?:final\s+)?answer\s*(?:is|=|:)?\s*$",
+        "",
+        cleaned,
+    )
+    return cleaned.rstrip(" .,:;，。；：").strip()
 
 
 def load_s1k_records(
@@ -171,6 +377,15 @@ class SFTFormatConfig:
     answer_leading_newline: bool = False
     boxed_prompt: bool = False
     supervise_answer_window_eos: bool = False
+    fixed_layout: bool = False
+    question_block_len: int = 231
+    reasoning_block_len: int = 530
+    final_answer_block_len: int = 263
+    fixed_layout_reasoning_start: int | None = None
+    fixed_layout_final_answer_start: int | None = None
+    reasoning_field: str = "solution"
+    final_answer_field: str = "answer"
+    fixed_layout_supervise_pad: bool = False
 
 
 def _truncate_answer(
@@ -192,11 +407,161 @@ def _truncate_answer(
     raise ValueError(f"Unknown answer_truncate mode: {mode}")
 
 
+def _fit_block(
+    tokenizer: GPT2TokenizerFast,
+    text: str,
+    block_len: int,
+    eos_token_id: int,
+    add_eos: bool = False,
+    truncate: str = "head",
+) -> tuple[list[int], list[int], int]:
+    if block_len <= 0:
+        return [], [], 0
+    ids = tokenizer.encode(str(text or ""), add_special_tokens=False)
+    if add_eos:
+        ids = ids + [eos_token_id]
+    ids = _truncate_answer(ids, block_len, eos_token_id, truncate)
+    true_len = len(ids)
+    padded = ids + [eos_token_id] * (block_len - true_len)
+    real_mask = [1] * true_len + [0] * (block_len - true_len)
+    return padded, real_mask, true_len
+
+
+def format_fixed_sft_record(
+    record: dict,
+    tokenizer: GPT2TokenizerFast,
+    cfg: SFTFormatConfig,
+) -> dict:
+    reasoning_start = (
+        cfg.fixed_layout_reasoning_start
+        if cfg.fixed_layout_reasoning_start is not None
+        else cfg.question_block_len
+    )
+    final_answer_start = (
+        cfg.fixed_layout_final_answer_start
+        if cfg.fixed_layout_final_answer_start is not None
+        else reasoning_start + cfg.reasoning_block_len
+    )
+    if cfg.question_block_len < 0 or cfg.reasoning_block_len < 0 or cfg.final_answer_block_len < 0:
+        raise ValueError("fixed layout block lengths must be non-negative")
+    if reasoning_start < cfg.question_block_len:
+        raise ValueError("fixed layout reasoning_start overlaps question block")
+    if reasoning_start + cfg.reasoning_block_len > cfg.max_length:
+        raise ValueError("fixed layout reasoning block exceeds max_length")
+    if final_answer_start < reasoning_start + cfg.reasoning_block_len:
+        raise ValueError("fixed layout final_answer_start overlaps reasoning block")
+    if final_answer_start + cfg.final_answer_block_len > cfg.max_length:
+        raise ValueError("fixed layout final answer block exceeds max_length")
+    if (
+        cfg.fixed_layout_reasoning_start is None
+        and cfg.fixed_layout_final_answer_start is None
+        and cfg.question_block_len + cfg.reasoning_block_len + cfg.final_answer_block_len != cfg.max_length
+    ):
+        raise ValueError(
+            "contiguous fixed layout block lengths must sum to max_length: "
+            f"{cfg.question_block_len}+{cfg.reasoning_block_len}+"
+            f"{cfg.final_answer_block_len}!={cfg.max_length}"
+        )
+
+    eos_token_id = tokenizer.eos_token_id
+    question = str(record.get("question", "")).strip()
+    source_answer = get_answer_text(record, cfg.reasoning_field)
+    final_answer = get_final_answer_text(
+        record,
+        cfg.final_answer_field,
+        source_answer=source_answer,
+    )
+    if not final_answer:
+        final_answer = extract_boxed(source_answer) or ""
+    reasoning_text = strip_last_boxed(source_answer)
+
+    question_ids, question_real_mask, question_len = _fit_block(
+        tokenizer,
+        f"Question:\n{question}",
+        cfg.question_block_len,
+        eos_token_id,
+        add_eos=False,
+        truncate="head",
+    )
+    reasoning_ids, reasoning_real_mask, reasoning_len = _fit_block(
+        tokenizer,
+        reasoning_text,
+        cfg.reasoning_block_len,
+        eos_token_id,
+        add_eos=False,
+        truncate=cfg.answer_truncate,
+    )
+    final_answer_ids, final_answer_real_mask, final_answer_len = _fit_block(
+        tokenizer,
+        final_answer,
+        cfg.final_answer_block_len,
+        eos_token_id,
+        add_eos=True,
+        truncate="head",
+    )
+
+    input_ids = [eos_token_id] * cfg.max_length
+    question_block_mask = [0] * cfg.max_length
+    generation_block_mask = [0] * cfg.max_length
+    real_generation_mask = [0] * cfg.max_length
+    real_token_mask = [0] * cfg.max_length
+
+    input_ids[: cfg.question_block_len] = question_ids
+    question_block_mask[: cfg.question_block_len] = [1] * cfg.question_block_len
+    real_token_mask[: cfg.question_block_len] = question_real_mask
+
+    reasoning_end = reasoning_start + cfg.reasoning_block_len
+    input_ids[reasoning_start:reasoning_end] = reasoning_ids
+    generation_block_mask[reasoning_start:reasoning_end] = [1] * cfg.reasoning_block_len
+    real_generation_mask[reasoning_start:reasoning_end] = reasoning_real_mask
+    real_token_mask[reasoning_start:reasoning_end] = reasoning_real_mask
+
+    final_answer_end = final_answer_start + cfg.final_answer_block_len
+    input_ids[final_answer_start:final_answer_end] = final_answer_ids
+    generation_block_mask[final_answer_start:final_answer_end] = [1] * cfg.final_answer_block_len
+    real_generation_mask[final_answer_start:final_answer_end] = final_answer_real_mask
+    real_token_mask[final_answer_start:final_answer_end] = final_answer_real_mask
+
+    if cfg.fixed_layout_supervise_pad:
+        answer_mask = generation_block_mask
+        pad_mask = [1] * cfg.max_length
+    else:
+        answer_mask = real_generation_mask
+        pad_mask = real_token_mask
+
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "prompt_mask": torch.tensor(question_block_mask, dtype=torch.bool),
+        "answer_mask": torch.tensor(answer_mask, dtype=torch.bool),
+        "pad_mask": torch.tensor(pad_mask, dtype=torch.bool),
+        "prompt_len": torch.tensor(cfg.question_block_len, dtype=torch.long),
+        "answer_len": torch.tensor(reasoning_len + final_answer_len, dtype=torch.long),
+        "answer_window_len": torch.tensor(
+            cfg.reasoning_block_len + cfg.final_answer_block_len,
+            dtype=torch.long,
+        ),
+        "reasoning_len": torch.tensor(reasoning_len, dtype=torch.long),
+        "final_answer_len": torch.tensor(final_answer_len, dtype=torch.long),
+        "question_block_len": torch.tensor(cfg.question_block_len, dtype=torch.long),
+        "reasoning_start": torch.tensor(reasoning_start, dtype=torch.long),
+        "reasoning_block_len": torch.tensor(cfg.reasoning_block_len, dtype=torch.long),
+        "final_answer_block_len": torch.tensor(cfg.final_answer_block_len, dtype=torch.long),
+        "final_answer_start": torch.tensor(final_answer_start, dtype=torch.long),
+        "question": question,
+        "answer": reasoning_text,
+        "final_answer": final_answer,
+        "prompt_text": f"Question:\n{question}",
+    }
+
+
 def format_sft_record(
     record: dict,
     tokenizer: GPT2TokenizerFast,
     cfg: SFTFormatConfig,
 ) -> dict:
+    if cfg.fixed_layout:
+        return format_fixed_sft_record(record, tokenizer, cfg)
+
     pad_token_id = tokenizer.eos_token_id
     question = str(record.get("question", "")).strip()
     answer_text = get_answer_text(record, cfg.answer_field)
@@ -255,8 +620,16 @@ def format_sft_record(
         "pad_mask": torch.tensor(pad_mask, dtype=torch.bool),
         "prompt_len": torch.tensor(len(prompt_ids), dtype=torch.long),
         "answer_len": torch.tensor(len(answer_ids), dtype=torch.long),
+        "answer_window_len": torch.tensor(cfg.max_answer_len, dtype=torch.long),
+        "reasoning_len": torch.tensor(0, dtype=torch.long),
+        "final_answer_len": torch.tensor(len(answer_ids), dtype=torch.long),
+        "question_block_len": torch.tensor(len(prompt_ids), dtype=torch.long),
+        "reasoning_block_len": torch.tensor(0, dtype=torch.long),
+        "final_answer_block_len": torch.tensor(cfg.max_answer_len, dtype=torch.long),
+        "final_answer_start": torch.tensor(len(prompt_ids), dtype=torch.long),
         "question": question,
         "answer": answer_text,
+        "final_answer": answer_text,
         "prompt_text": prompt_text,
     }
 
@@ -305,12 +678,28 @@ class S1KResponseDataset(Dataset):
 
 
 def collate_sft(batch: list[dict]) -> dict:
-    tensor_keys = ("input_ids", "prompt_mask", "answer_mask", "pad_mask", "prompt_len", "answer_len")
+    tensor_keys = (
+        "input_ids",
+        "prompt_mask",
+        "answer_mask",
+        "pad_mask",
+        "prompt_len",
+        "answer_len",
+        "answer_window_len",
+        "reasoning_len",
+        "final_answer_len",
+        "question_block_len",
+        "reasoning_start",
+        "reasoning_block_len",
+        "final_answer_block_len",
+        "final_answer_start",
+    )
     out = {key: torch.stack([item[key] for item in batch]) for key in tensor_keys}
     out["condition_len"] = out["prompt_len"]
     out["boxed_mask"] = out["answer_mask"].long()
     out["question"] = [item["question"] for item in batch]
     out["answer"] = [item["answer"] for item in batch]
+    out["final_answer"] = [item["final_answer"] for item in batch]
     out["prompt_text"] = [item["prompt_text"] for item in batch]
     return out
 
